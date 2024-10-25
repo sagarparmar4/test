@@ -1,84 +1,60 @@
 import aioboto3
 import asyncio
-import logging
+from botocore.exceptions import ClientError, BotoCoreError
 
-# Configure logging to output to console and log file
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('s3_copy.log')
-    ]
-)
-
-# Configuration variables for source and destination roles and buckets
-source_role_arn = 'arn:aws:iam::SOURCE_ACCOUNT_ID:role/YOUR_SOURCE_ROLE'
-destination_role_arn = 'arn:aws:iam::DESTINATION_ACCOUNT_ID:role/YOUR_DESTINATION_ROLE'
+# Configuration variables for source and destination profiles and buckets
+source_profile = 'your_source_profile'
+destination_profile = 'your_destination_profile'
 source_bucket = 'your-source-bucket-name'
 destination_bucket = 'your-destination-bucket-name'
-BATCH_SIZE = 100
+BATCH_SIZE = 100  # Adjust based on your requirements
 
-# Global variables to hold assumed role credentials
-source_credentials = None
-destination_credentials = None
+async def get_s3_client(profile_name, region_name='us-west-2'):
+    session = aioboto3.Session(profile_name=profile_name)
+    return await session.client('s3', region_name=region_name)
 
-async def assume_role(role_arn):
-    async with aioboto3.client('sts') as sts_client:
-        logging.info(f'Assuming role: {role_arn}')
-        response = await sts_client.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName='SessionName'
+async def copy_object(source_client, dest_client, key):
+    try:
+        # Use the copy_object method to copy only the metadata
+        await dest_client.copy_object(
+            Bucket=destination_bucket,
+            CopySource={'Bucket': source_bucket, 'Key': key},
+            Key=key
         )
-        return response['Credentials']
-
-async def refresh_credentials():
-    global source_credentials, destination_credentials
-    source_credentials = await assume_role(source_role_arn)
-    destination_credentials = await assume_role(destination_role_arn)
-    logging.info('Refreshed AWS credentials.')
-
-async def get_source_s3_client():
-    return aioboto3.client(
-        's3',
-        aws_access_key_id=source_credentials['AccessKeyId'],
-        aws_secret_access_key=source_credentials['SecretAccessKey'],
-        aws_session_token=source_credentials['SessionToken'],
-        region_name='source-region'
-    )
-
-async def get_destination_s3_client():
-    return aioboto3.client(
-        's3',
-        aws_access_key_id=destination_credentials['AccessKeyId'],
-        aws_secret_access_key=destination_credentials['SecretAccessKey'],
-        aws_session_token=destination_credentials['SessionToken'],
-        region_name='destination-region'
-    )
+        return True
+    except (ClientError, BotoCoreError) as e:
+        if e.response['Error']['Code'] in ['ExpiredToken', 'InvalidClientTokenId']:
+            return False  # Indicate the need to refresh the token
+    except Exception:
+        return False  # Handle any unexpected errors
+    return True  # Indicate success
 
 async def copy_batch(keys):
-    async with get_source_s3_client() as source_client, get_destination_s3_client() as dest_client:
+    source_client = await get_s3_client(source_profile)
+    dest_client = await get_s3_client(destination_profile)
+
+    async with source_client, dest_client:
         for key in keys:
-            try:
-                logging.info(f'Copying {key}...')
-                source_object = await source_client.get_object(Bucket=source_bucket, Key=key)
-                data = await source_object['Body'].read()
-                await dest_client.put_object(Bucket=destination_bucket, Key=key, Body=data)
-                logging.info(f'Successfully copied {key}')
-            except Exception as e:
-                logging.error(f'Failed to copy {key}: {e}')
+            # Add a retry mechanism for token expiration
+            while True:
+                success = await copy_object(source_client, dest_client, key)
+                if not success:
+                    # If token expired, refresh and retry
+                    source_client = await get_s3_client(source_profile)
+                    dest_client = await get_s3_client(destination_profile)
+                else:
+                    break
 
 async def copy_objects():
-    await refresh_credentials()
-    async with get_source_s3_client() as source_client:
-        response = await source_client.list_objects_v2(Bucket=source_bucket)
-        keys = [obj['Key'] for obj in response.get('Contents', [])]
+    async with get_s3_client(source_profile) as source_client:
+        paginator = source_client.get_paginator('list_objects_v2')
+        async for page in paginator.paginate(Bucket=source_bucket):
+            keys = [obj['Key'] for obj in page.get('Contents', [])]
 
-        tasks = [
-            copy_batch(keys[i:i + BATCH_SIZE])
-            for i in range(0, len(keys), BATCH_SIZE)
-        ]
-        await asyncio.gather(*tasks)
+            # Process keys in batches
+            for i in range(0, len(keys), BATCH_SIZE):
+                batch = keys[i:i + BATCH_SIZE]
+                await copy_batch(batch)
 
 if __name__ == '__main__':
     asyncio.run(copy_objects())
