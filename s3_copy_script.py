@@ -1,60 +1,76 @@
 import aioboto3
 import asyncio
-from botocore.exceptions import ClientError, BotoCoreError
+import time
+from botocore.exceptions import ClientError
 
-# Configuration variables for source and destination profiles and buckets
-source_profile = 'your_source_profile'
-destination_profile = 'your_destination_profile'
-source_bucket = 'your-source-bucket-name'
-destination_bucket = 'your-destination-bucket-name'
-BATCH_SIZE = 100  # Adjust based on your requirements
+SOURCE_BUCKET = 'source-bucket-name'
+DEST_BUCKET = 'destination-bucket-name'
+SOURCE_PROFILE = 'source-profile'
+DEST_PROFILE = 'destination-profile'
 
-async def get_s3_client(profile_name, region_name='us-west-2'):
-    session = aioboto3.Session(profile_name=profile_name)
-    return await session.client('s3', region_name=region_name)
+# Counters for tracking progress
+total_keys_read = 0
+total_uploaded = 0
+total_failed = 0
 
-async def copy_object(source_client, dest_client, key):
-    try:
-        # Use the copy_object method to copy only the metadata
-        await dest_client.copy_object(
-            Bucket=destination_bucket,
-            CopySource={'Bucket': source_bucket, 'Key': key},
-            Key=key
-        )
-        return True
-    except (ClientError, BotoCoreError) as e:
-        if e.response['Error']['Code'] in ['ExpiredToken', 'InvalidClientTokenId']:
-            return False  # Indicate the need to refresh the token
-    except Exception:
-        return False  # Handle any unexpected errors
-    return True  # Indicate success
+# Function to create a new session for the specified profile
+def create_session(profile_name):
+    return aioboto3.Session(profile_name=profile_name)
 
-async def copy_batch(keys):
-    source_client = await get_s3_client(source_profile)
-    dest_client = await get_s3_client(destination_profile)
+# Function to download and upload a single object
+async def transfer_object(key, source_session, dest_session):
+    global total_uploaded, total_failed
+    while True:
+        try:
+            # Establish clients for source and destination buckets
+            async with source_session.client('s3') as s3_source, dest_session.client('s3') as s3_dest:
+                # Download the object from the source bucket
+                response = await s3_source.get_object(Bucket=SOURCE_BUCKET, Key=key)
+                data = await response['Body'].read()
 
-    async with source_client, dest_client:
-        for key in keys:
-            # Add a retry mechanism for token expiration
-            while True:
-                success = await copy_object(source_client, dest_client, key)
-                if not success:
-                    # If token expired, refresh and retry
-                    source_client = await get_s3_client(source_profile)
-                    dest_client = await get_s3_client(destination_profile)
-                else:
-                    break
+                # Upload the object to the destination bucket
+                await s3_dest.put_object(Bucket=DEST_BUCKET, Key=key, Body=data)
+            total_uploaded += 1  # Increment uploaded count if successful
+            break  # Exit loop after successful transfer
+        except ClientError as e:
+            # Check for token expiry error
+            if e.response['Error']['Code'] == 'ExpiredToken':
+                # Refresh the sessions on token expiry
+                source_session = create_session(SOURCE_PROFILE)
+                dest_session = create_session(DEST_PROFILE)
+            else:
+                total_failed += 1  # Increment failed count if error persists
+                print(f"Failed to upload {key}: {e}")
+                break  # Break on persistent errors other than token expiry
 
-async def copy_objects():
-    async with get_s3_client(source_profile) as source_client:
-        paginator = source_client.get_paginator('list_objects_v2')
-        async for page in paginator.paginate(Bucket=source_bucket):
-            keys = [obj['Key'] for obj in page.get('Contents', [])]
+# Main function to paginate and process all objects in the source bucket
+async def main():
+    global total_keys_read
+    source_session = create_session(SOURCE_PROFILE)
+    dest_session = create_session(DEST_PROFILE)
 
-            # Process keys in batches
-            for i in range(0, len(keys), BATCH_SIZE):
-                batch = keys[i:i + BATCH_SIZE]
-                await copy_batch(batch)
+    async with source_session.client('s3') as s3_source:
+        paginator = s3_source.get_paginator('list_objects_v2')
+        
+        # Process each page of objects
+        async for page in paginator.paginate(Bucket=SOURCE_BUCKET):
+            page_start_time = time.time()  # Start time for each page
 
-if __name__ == '__main__':
-    asyncio.run(copy_objects())
+            if 'Contents' not in page:
+                continue  # Skip if there are no objects in this page
+
+            # Get all keys in the current page
+            keys = [obj['Key'] for obj in page['Contents']]
+            total_keys_read += len(keys)  # Track total keys read
+
+            # Process keys in parallel
+            tasks = [transfer_object(key, source_session, dest_session) for key in keys]
+            await asyncio.gather(*tasks)
+
+            # Log time taken for page and cumulative totals after each page
+            page_duration = time.time() - page_start_time
+            print(f"Processed page with {len(keys)} keys in {page_duration:.2f} seconds.")
+            print(f"Cumulative totals - Keys read: {total_keys_read}, Uploaded: {total_uploaded}, Failed: {total_failed}")
+
+# Run the main function
+asyncio.run(main())
