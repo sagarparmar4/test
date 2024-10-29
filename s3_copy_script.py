@@ -17,26 +17,21 @@ total_failed = 0
 def create_session(profile_name):
     return aioboto3.Session(profile_name=profile_name)
 
-# Function to download and upload a single object
+# Function to upload a single object
 async def transfer_object(key, source_session, dest_session):
     global total_uploaded, total_failed
     while True:
         try:
-            # Establish clients for source and destination buckets
-            async with source_session.client('s3') as s3_source, dest_session.client('s3') as s3_dest:
-                # Download the object from the source bucket
-                response = await s3_source.get_object(Bucket=SOURCE_BUCKET, Key=key)
-                data = await response['Body'].read()
-
+            # Establish clients for destination buckets
+            async with dest_session.client('s3') as s3_dest:
                 # Upload the object to the destination bucket
-                await s3_dest.put_object(Bucket=DEST_BUCKET, Key=key, Body=data)
+                await s3_dest.put_object(Bucket=DEST_BUCKET, Key=key)
             total_uploaded += 1  # Increment uploaded count if successful
             break  # Exit loop after successful transfer
         except ClientError as e:
             # Check for token expiry error
             if e.response['Error']['Code'] == 'ExpiredToken':
                 # Refresh the sessions on token expiry
-                source_session = create_session(SOURCE_PROFILE)
                 dest_session = create_session(DEST_PROFILE)
             else:
                 total_failed += 1  # Increment failed count if error persists
@@ -64,7 +59,7 @@ async def main():
             total_keys_read += len(keys)  # Track total keys read
 
             # Process keys in parallel
-            tasks = [transfer_object(key, source_session, dest_session) for key in keys]
+            tasks = [transfer_object(key, dest_session) for key in keys]
             await asyncio.gather(*tasks)
 
             # Log time taken for page and cumulative totals after each page
